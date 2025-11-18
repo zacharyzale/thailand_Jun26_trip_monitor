@@ -24,6 +24,11 @@ price_ceiling_usd: 3500
 preferred_departure_hours:
   earliest: 6
   latest: 22
+fast_test:
+  enabled: false
+  max_departure_dates: 1
+  max_return_dates: 1
+  max_sequences: 2
 plot_path: "plots/thailand_price_trend.png"
 history_csv: "data/thailand_tracker.csv"
 outbound_date_sample: "2026-05-30"

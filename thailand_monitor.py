@@ -31,6 +31,7 @@ import yaml
 from amadeus import Client
 from amadeus.client.errors import ClientError, ResponseError
 
+BANGKOK_AIRPORTS = ["BKK", "DMK"]
 REPO_ROOT = pathlib.Path(".")
 
 
@@ -131,6 +132,8 @@ class AmadeusClient:
             client_secret=os.environ["AMADEUS_CLIENT_SECRET"],
             hostname="production",
         )
+        self.cache: Dict[Tuple, Optional[LegChoice]] = {}
+        self.calls = 0
 
     def search_best_leg(
         self,
@@ -144,7 +147,24 @@ class AmadeusClient:
         prefer_window: Dict[str, int],
         nonstop_only: bool = False,
     ) -> Optional[LegChoice]:
+        key = (
+            origin,
+            dest,
+            date,
+            currency,
+            travel_class,
+            adults,
+            max_stops,
+            nonstop_only,
+            prefer_window.get("earliest", 6),
+            prefer_window.get("latest", 22),
+        )
+
+        if key in self.cache:
+            return self.cache[key]
+
         try:
+            self.calls += 1
             resp = self.client.shopping.flight_offers_search.get(
                 originLocationCode=origin,
                 destinationLocationCode=dest,
@@ -158,6 +178,7 @@ class AmadeusClient:
             status = getattr(getattr(e, "response", None), "status_code", "?")
             body = getattr(getattr(e, "response", None), "body", None)
             log(f"[Amadeus {origin}->{dest} {date}] HTTP {status} body={json.dumps(body or {}, ensure_ascii=False)[:400]}")
+            self.cache[key] = None
             return None
 
         offers = resp.data or []
@@ -195,9 +216,12 @@ class AmadeusClient:
             )
 
         if not choices:
+            self.cache[key] = None
             return None
         choices.sort(key=lambda c: (c.price, c.duration_hours, c.penalty, c.stops))
-        return choices[0]
+        best_choice = choices[0]
+        self.cache[key] = best_choice
+        return best_choice
 
 
 def generate_city_sequences(cfg: Dict) -> List[Tuple[str, ...]]:
@@ -278,25 +302,56 @@ def build_itinerary(
         pairs.append((city, next_city, hop_date))
     pairs.append((sequence[-1], origin, return_date))
 
+    def resolve_airports(city_code: str, is_domestic: bool) -> List[str]:
+        # For now, we treat "BKK" as a logical Bangkok city code and
+        # expand to BKK + DMK only for domestic legs.
+        if is_domestic and city_code == "BKK":
+            return BANGKOK_AIRPORTS
+        return [city_code]
+
     for idx, (o, d, day) in enumerate(pairs):
         is_domestic = o in sequence and d in sequence
-        leg = client.search_best_leg(
-            origin=o,
-            dest=d,
-            date=day,
-            currency=currency,
-            travel_class=travel_class,
-            adults=adults,
-            max_stops=0 if domestic_nonstop and is_domestic else max_stops_ord,
-            prefer_window=prefer_window,
-            nonstop_only=domestic_nonstop and is_domestic,
-        )
-        if not leg:
+        origin_candidates = resolve_airports(o, is_domestic)
+        dest_candidates = resolve_airports(d, is_domestic)
+
+        best_leg: Optional[LegChoice] = None
+        for o_code in origin_candidates:
+            for d_code in dest_candidates:
+                leg_candidate = client.search_best_leg(
+                    origin=o_code,
+                    dest=d_code,
+                    date=day,
+                    currency=currency,
+                    travel_class=travel_class,
+                    adults=adults,
+                    max_stops=0 if domestic_nonstop and is_domestic else max_stops_ord,
+                    prefer_window=prefer_window,
+                    nonstop_only=domestic_nonstop and is_domestic,
+                )
+                if not leg_candidate:
+                    continue
+                if (
+                    best_leg is None
+                    or (
+                        leg_candidate.price,
+                        leg_candidate.duration_hours,
+                        leg_candidate.penalty,
+                    )
+                    < (best_leg.price, best_leg.duration_hours, best_leg.penalty)
+                ):
+                    best_leg = leg_candidate
+
+        if not best_leg:
             return None
-        legs.append(leg)
-        total_price += leg.price
-        total_duration += leg.duration_hours
+
+        legs.append(best_leg)
+        total_price += best_leg.price
+        total_duration += best_leg.duration_hours
         if price_cap and total_price > float(price_cap):
+            log(
+                f"Pruned itinerary {sequence} {depart_date}->{return_date} due to price cap "
+                f"({total_price:.0f} > {float(price_cap):.0f})"
+            )
             return None
 
     airlines = sorted({a for leg in legs for a in leg.airlines})
@@ -322,17 +377,60 @@ def best_itinerary(cfg: Dict, client: AmadeusClient) -> Optional[Dict]:
         log("No candidate city sequences generated; check config.")
         return None
 
+    fast_cfg = cfg.get("fast_test", {})
+    fast_enabled = bool(fast_cfg.get("enabled", False))
+
+    if fast_enabled:
+        max_dep = int(fast_cfg.get("max_departure_dates", 1))
+        max_ret = int(fast_cfg.get("max_return_dates", 1))
+        max_seq = int(fast_cfg.get("max_sequences", 2))
+
+        dep_range = dep_range[:max_dep]
+        ret_range = ret_range[:max_ret]
+        sequences = sequences[:max_seq]
+
+        log(
+            f"FAST TEST MODE: limiting to {len(dep_range)} departure date(s), "
+            f"{len(ret_range)} return date(s), {len(sequences)} sequence(s)"
+        )
+
+    num_dep = len(dep_range)
+    num_ret = len(ret_range)
+    num_seq = len(sequences)
+    log(f"Evaluating {num_dep} departure date(s), {num_ret} return date(s), {num_seq} city sequence(s)")
+
+    approx_itins = sum(1 for dep in dep_range for ret in ret_range if dep < ret) * num_seq
+    log(f"Approximate maximum itineraries to try: {approx_itins}")
+
+    itins_tried = 0
+    itins_success = 0
+    start_time = dt.datetime.utcnow()
+
     candidates: List[Dict] = []
     for dep in dep_range:
         for ret in ret_range:
             if dep >= ret:
                 continue
-            for seq in sequences:
+            for seq_idx, seq in enumerate(sequences, start=1):
+                itins_tried += 1
+                if itins_tried % 10 == 1:
+                    elapsed = (dt.datetime.utcnow() - start_time).total_seconds()
+                    log(
+                        f"[progress] Tried {itins_tried}/{approx_itins} itineraries "
+                        f"so far (elapsed ~{elapsed:.1f}s)"
+                    )
+
                 itin = build_itinerary(seq, dep, ret, cfg, client)
                 if itin:
+                    itins_success += 1
                     candidates.append(itin)
 
     if not candidates:
+        elapsed_total = (dt.datetime.utcnow() - start_time).total_seconds()
+        log(
+            f"Finished itinerary search: {itins_tried} attempted, {itins_success} successful "
+            f"({elapsed_total:.1f}s)"
+        )
         return None
 
     prefer_window = cfg.get("preferred_departure_hours", {"earliest": 6, "latest": 22})
@@ -350,6 +448,11 @@ def best_itinerary(cfg: Dict, client: AmadeusClient) -> Optional[Dict]:
             itinerary_penalty(i),
             len(i["sequence"]),
         )
+    )
+    elapsed_total = (dt.datetime.utcnow() - start_time).total_seconds()
+    log(
+        f"Finished itinerary search: {itins_tried} attempted, {itins_success} successful "
+        f"({elapsed_total:.1f}s)"
     )
     return candidates[0]
 
@@ -555,6 +658,25 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
     cfg = load_config(pathlib.Path(args.config))
+    log("=== Thailand 2026 monitor run started ===")
+    log(
+        f"Trip name: {cfg.get('trip_name', '(none)')}, origin={cfg.get('origin','ORD')}, "
+        f"currency={cfg.get('currency','USD')}, adults={cfg.get('adults',1)}, cabin={cfg.get('cabin','ECONOMY')}"
+    )
+    dw = cfg.get("departure_window", {})
+    rw = cfg.get("return_window", {})
+    log(
+        f"Departure window: {dw.get('start')} → {dw.get('end')}; "
+        f"Return window: {rw.get('start')} → {rw.get('end')}"
+    )
+    fast_cfg = cfg.get("fast_test", {})
+    if fast_cfg:
+        log(
+            f"Fast test enabled={fast_cfg.get('enabled', False)}; "
+            f"max_dep={fast_cfg.get('max_departure_dates', 'n/a')}, "
+            f"max_ret={fast_cfg.get('max_return_dates', 'n/a')}, "
+            f"max_seq={fast_cfg.get('max_sequences', 'n/a')}"
+        )
     client = AmadeusClient()
 
     best = best_itinerary(cfg, client)
@@ -571,6 +693,7 @@ def main():
     print(render_markdown_table(best))
     log(f"Best itinerary ID: {best['itinerary_id']}")
     log(f"Markdown summary: {best_md}")
+    log(f"Total Amadeus API calls this run: {client.calls}")
 
     send_email_notification(best, cfg, history_path, best_md, plot_path)
 
