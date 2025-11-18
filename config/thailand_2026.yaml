@@ -32,7 +32,7 @@ email:
   enabled: true
   sender: "Thailand Monitor <notifier@example.com>"
   recipients:
-    - "your_email@example.com"
+    - "zacharyzale@gmail.com"
   smtp_host: "smtp.gmail.com"
   smtp_port: 587
   use_starttls: true
