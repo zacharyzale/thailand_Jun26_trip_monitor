@@ -3,3 +3,4 @@ requests>=2.31.0
 python-dateutil>=2.9.0
 matplotlib>=3.9.0
 pandas>=2.2.0
+PyYAML>=6.0

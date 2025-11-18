@@ -1,0 +1,41 @@
+trip_name: "thailand_2026"
+origin: "ORD"
+departure_window:
+  start: "2026-05-29"
+  end: "2026-06-01"
+return_window:
+  start: "2026-06-12"
+  end: "2026-06-14"
+cabin: "ECONOMY"
+currency: "USD"
+adults: 1
+max_stopovers_ord_legs: 1
+domestic_nonstop_only: true
+min_cities: 2
+max_cities: 3
+beach_cities:
+  - "HKT"
+  - "USM"
+  - "KBV"
+inland_cities:
+  - "CNX"
+mandatory_city: "BKK"
+price_ceiling_usd: 3500
+preferred_departure_hours:
+  earliest: 6
+  latest: 22
+plot_path: "plots/thailand_price_trend.png"
+history_csv: "data/thailand_tracker.csv"
+outbound_date_sample: "2026-05-30"
+return_date_sample: "2026-06-13"
+email:
+  enabled: true
+  sender: "Thailand Monitor <notifier@example.com>"
+  recipients:
+    - "your_email@example.com"
+  smtp_host: "smtp.gmail.com"
+  smtp_port: 587
+  use_starttls: true
+  username_env: "SMTP_USERNAME"
+  password_env: "SMTP_PASSWORD"
+  include_plot: true

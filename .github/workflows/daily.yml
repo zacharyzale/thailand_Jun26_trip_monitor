@@ -1,11 +1,11 @@
-name: ORD→Europe Daily Fare Check
+name: Thailand 2026 Daily Monitor
 
 permissions:
   contents: write   # allow committing updated history/charts
 
 on:
-  #schedule:
-  #  - cron: "0 13 * * *"  # daily 13:00 UTC
+  schedule:
+    - cron: "0 13 * * *"  # daily 13:00 UTC
   workflow_dispatch: {}
 
 jobs:
@@ -19,34 +19,24 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
-      - name: Run monitor
+
+      - name: Run Thailand 2026 monitor
         env:
           AMADEUS_CLIENT_ID: ${{ secrets.AMADEUS_CLIENT_ID }}
           AMADEUS_CLIENT_SECRET: ${{ secrets.AMADEUS_CLIENT_SECRET }}
-          TO_EMAIL: ${{ secrets.TO_EMAIL }}
-          FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASS: ${{ secrets.SMTP_PASS }}
-          SMTP_HOST: smtp.gmail.com
-          SMTP_PORT: "587"
-        run: python monitor.py
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+        run: python thailand_monitor.py --config config/thailand_2026.yaml
 
-      # Commit updated history & charts so the time series persist
-      - name: Commit history and charts
+      # Commit updated history & plot so the time series persist
+      - name: Commit Thailand artifacts
         run: |
           git config user.name "github-actions"
           git config user.email "actions@users.noreply.github.com"
-          git add data/prices_history.csv charts/*.png || true
+          git add data/thailand_tracker.csv data/thailand_best.md plots/thailand_price_trend.png || true
           if ! git diff --cached --quiet; then
-            git commit -m "Update history and charts [skip ci]"
+            git commit -m "Update Thailand tracker [skip ci]"
             git push
           else
             echo "No changes to commit."
           fi
-
-      - name: Upload today CSV artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ord-europe-2026-03-22_04-02
-          path: prices.csv
-          retention-days: 30
