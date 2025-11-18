@@ -619,7 +619,6 @@ def send_email_notification(
         msg.add_attachment(
             best_md_path.read_text(),
             subtype="markdown",
-            maintype="text",
             filename=best_md_path.name,
         )
 
