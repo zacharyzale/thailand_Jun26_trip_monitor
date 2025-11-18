@@ -19,6 +19,9 @@ import pathlib
 import sys
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+from email.message import EmailMessage
+import smtplib
+import ssl
 
 import matplotlib
 matplotlib.use("Agg")
@@ -449,6 +452,100 @@ def plot_price_trend(history_csv: pathlib.Path, out_path: pathlib.Path) -> Optio
     return out_path
 
 
+def send_email_notification(
+    best: Dict,
+    cfg: Dict,
+    history_path: pathlib.Path,
+    best_md_path: pathlib.Path,
+    plot_path: Optional[pathlib.Path],
+) -> None:
+    email_cfg = cfg.get("email", {})
+    if not email_cfg.get("enabled"):
+        log("Email disabled in config; skipping notification.")
+        return
+
+    recipients = email_cfg.get("recipients") or []
+    if not recipients:
+        log("Email enabled but no recipients configured; skipping notification.")
+        return
+
+    smtp_host = email_cfg.get("smtp_host")
+    smtp_port = int(email_cfg.get("smtp_port", 587))
+    use_starttls = bool(email_cfg.get("use_starttls", True))
+    username_env = email_cfg.get("username_env")
+    password_env = email_cfg.get("password_env")
+    username = os.environ.get(username_env) if username_env else None
+    password = os.environ.get(password_env) if password_env else None
+
+    if not smtp_host:
+        log("SMTP host not set; skipping email notification.")
+        return
+    if username_env and not username:
+        log(f"SMTP username missing in env {username_env}; skipping email.")
+        return
+    if password_env and not password:
+        log(f"SMTP password missing in env {password_env}; skipping email.")
+        return
+
+    sender = email_cfg.get("sender") or username or "thailand-monitor@example.com"
+    subject = (
+        f"[Thailand 2026] ${best['total_price']:.0f} • {' > '.join(best['sequence'])}"
+        f" ({best['depart_date']} → {best['return_date']})"
+    )
+
+    body = "\n".join(
+        [
+            "Thailand 2026 daily fare update",
+            f"Depart {best['depart_date']} → Return {best['return_date']}",
+            f"Route: {' > '.join(best['sequence'])}",
+            f"Total price: ${best['total_price']:.2f}",
+            f"Total travel time: {best['total_duration_hours']:.1f}h",
+            "",
+            "Legs (Markdown table):",
+            render_markdown_table(best),
+        ]
+    )
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = sender
+    msg["To"] = ", ".join(recipients)
+    msg.set_content(body)
+
+    if best_md_path.exists():
+        msg.add_attachment(
+            best_md_path.read_text(),
+            subtype="markdown",
+            maintype="text",
+            filename=best_md_path.name,
+        )
+
+    if history_path.exists():
+        msg.add_attachment(
+            history_path.read_bytes(),
+            maintype="text",
+            subtype="csv",
+            filename=history_path.name,
+        )
+
+    if email_cfg.get("include_plot", True) and plot_path and plot_path.exists():
+        msg.add_attachment(
+            plot_path.read_bytes(),
+            maintype="image",
+            subtype="png",
+            filename=plot_path.name,
+        )
+
+    context = ssl.create_default_context()
+    with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+        if use_starttls:
+            server.starttls(context=context)
+        if username and password:
+            server.login(username, password)
+        server.send_message(msg)
+    log(f"Sent email notification to {', '.join(recipients)}")
+
+
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Monitor Thailand 2026 trip fares")
     ap.add_argument("--config", default="config/thailand_2026.yaml", help="Path to YAML config")
@@ -469,11 +566,13 @@ def main():
     best_md = write_best_markdown(best, cfg)
 
     plot_path_cfg = cfg.get("plot_path", "plots/thailand_price_trend.png")
-    plot_price_trend(history_path, REPO_ROOT / plot_path_cfg)
+    plot_path = plot_price_trend(history_path, REPO_ROOT / plot_path_cfg)
 
     print(render_markdown_table(best))
     log(f"Best itinerary ID: {best['itinerary_id']}")
     log(f"Markdown summary: {best_md}")
+
+    send_email_notification(best, cfg, history_path, best_md, plot_path)
 
 
 if __name__ == "__main__":

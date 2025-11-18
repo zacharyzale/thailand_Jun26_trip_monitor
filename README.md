@@ -37,7 +37,7 @@ The trip parameters live in `config/thailand_2026.yaml` and can be edited withou
 Tweak the windows or city lists to explore different date ranges or destinations. For quick smoke tests, narrow the date windows to a single day to reduce API calls.
 
 ## Running the Thailand monitor locally
-The Thailand workflow does **not** send email; it just computes and saves artifacts.
+By default the monitor will also send an email if SMTP settings are configured (see **Email notifications** below).
 
 ```bash
 python thailand_monitor.py --config config/thailand_2026.yaml
@@ -48,5 +48,27 @@ Outputs:
 - `data/thailand_best.md`: Markdown summary with a leg-by-leg table.
 - `plots/thailand_price_trend.png`: run-date vs total-price trend line.
 
+### Email notifications
+Email is configured in `config/thailand_2026.yaml` under the `email` block:
+
+```yaml
+email:
+  enabled: true
+  sender: "Thailand Monitor <notifier@example.com>"
+  recipients:
+    - "your_email@example.com"
+  smtp_host: "smtp.gmail.com"
+  smtp_port: 587
+  use_starttls: true
+  username_env: "SMTP_USERNAME"
+  password_env: "SMTP_PASSWORD"
+  include_plot: true
+```
+
+Provide SMTP credentials via environment variables referenced by `username_env` / `password_env`, e.g. `export SMTP_USERNAME=...` and `export SMTP_PASSWORD=...`. Set `enabled: false` to skip emails. When enabled, the Markdown summary is attached to the message and the price-trend plot is attached if available.
+
 ## GitHub Actions
-`.github/workflows/daily.yml` installs dependencies and runs only the Thailand monitor (`thailand_monitor.py`) on a daily schedule (13:00 UTC). Updated artifacts (`data/thailand_tracker.csv`, `data/thailand_best.md`, `plots/thailand_price_trend.png`) are committed back to the repo so the time series persist.
+`.github/workflows/daily.yml` installs dependencies and runs only the Thailand monitor (`thailand_monitor.py`) on a daily schedule (13:00 UTC). Updated artifacts (`data/thailand_tracker.csv`, `data/thailand_best.md`, `plots/thailand_price_trend.png`) are committed back to the repo so the time series persist. Set the following GitHub Actions secrets for automation:
+
+- `AMADEUS_CLIENT_ID` / `AMADEUS_CLIENT_SECRET` (required)
+- `SMTP_USERNAME` / `SMTP_PASSWORD` (required if `email.enabled` is true)

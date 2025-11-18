@@ -24,6 +24,8 @@ jobs:
         env:
           AMADEUS_CLIENT_ID: ${{ secrets.AMADEUS_CLIENT_ID }}
           AMADEUS_CLIENT_SECRET: ${{ secrets.AMADEUS_CLIENT_SECRET }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
         run: python thailand_monitor.py --config config/thailand_2026.yaml
 
       # Commit updated history & plot so the time series persist

@@ -28,3 +28,14 @@ plot_path: "plots/thailand_price_trend.png"
 history_csv: "data/thailand_tracker.csv"
 outbound_date_sample: "2026-05-30"
 return_date_sample: "2026-06-13"
+email:
+  enabled: true
+  sender: "Thailand Monitor <notifier@example.com>"
+  recipients:
+    - "your_email@example.com"
+  smtp_host: "smtp.gmail.com"
+  smtp_port: 587
+  use_starttls: true
+  username_env: "SMTP_USERNAME"
+  password_env: "SMTP_PASSWORD"
+  include_plot: true
