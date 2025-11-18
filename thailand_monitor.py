@@ -34,6 +34,21 @@ from amadeus.client.errors import ClientError, ResponseError
 BANGKOK_AIRPORTS = ["BKK", "DMK"]
 REPO_ROOT = pathlib.Path(".")
 
+AIRPORT_CITY_NAMES = {
+    "BKK": "Bangkok",
+    "DMK": "Bangkok",
+    "HKT": "Phuket",
+    "USM": "Koh Samui",
+    "KBV": "Krabi",
+    "CNX": "Chiang Mai",
+    "ORD": "Chicago",
+}
+
+
+def format_location_label(code: str) -> str:
+    city = AIRPORT_CITY_NAMES.get(code.upper())
+    return f"{code} ({city})" if city else code
+
 
 def log(msg: str) -> None:
     ts = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -103,8 +118,8 @@ def segments_summary(segments: List[Dict]) -> Tuple[str, List[str], List[str]]:
             arr = dt.datetime.fromisoformat(prev["arrival"]["at"])
             dep = dt.datetime.fromisoformat(nxt["departure"]["at"])
             diff = dep - arr
-            mins = int(diff.total_seconds() // 60)
-            layovers.append(f"{airport} ({mins}m)")
+            hours = diff.total_seconds() / 3600
+            layovers.append(f"{format_location_label(airport)} ({hours:.1f}h)")
     return ", ".join(codes), airlines, layovers
 
 
@@ -122,6 +137,7 @@ class LegChoice:
     flight_codes: str
     airlines: List[str]
     layovers: List[str]
+    is_round_trip: bool
     penalty: float
 
 
@@ -196,6 +212,7 @@ class AmadeusClient:
             dep_iso = segments[0]["departure"]["at"]
             arr_iso = segments[-1]["arrival"]["at"]
             codes, airlines, layovers = segments_summary(segments)
+            is_round_trip = not bool(off.get("oneWay", True))
             penalty = time_penalty(dep_iso, prefer_window) + time_penalty(arr_iso, prefer_window)
             choices.append(
                 LegChoice(
@@ -211,6 +228,7 @@ class AmadeusClient:
                     flight_codes=codes,
                     airlines=airlines,
                     layovers=layovers,
+                    is_round_trip=is_round_trip,
                     penalty=penalty,
                 )
             )
@@ -369,13 +387,13 @@ def build_itinerary(
     }
 
 
-def best_itinerary(cfg: Dict, client: AmadeusClient) -> Optional[Dict]:
+def best_itineraries(cfg: Dict, client: AmadeusClient) -> List[Dict]:
     dep_range = iso_date_range(cfg["departure_window"]["start"], cfg["departure_window"]["end"])
     ret_range = iso_date_range(cfg["return_window"]["start"], cfg["return_window"]["end"])
     sequences = generate_city_sequences(cfg)
     if not sequences:
         log("No candidate city sequences generated; check config.")
-        return None
+        return []
 
     fast_cfg = cfg.get("fast_test", {})
     fast_enabled = bool(fast_cfg.get("enabled", False))
@@ -431,7 +449,7 @@ def best_itinerary(cfg: Dict, client: AmadeusClient) -> Optional[Dict]:
             f"Finished itinerary search: {itins_tried} attempted, {itins_success} successful "
             f"({elapsed_total:.1f}s)"
         )
-        return None
+        return []
 
     prefer_window = cfg.get("preferred_departure_hours", {"earliest": 6, "latest": 22})
 
@@ -454,58 +472,233 @@ def best_itinerary(cfg: Dict, client: AmadeusClient) -> Optional[Dict]:
         f"Finished itinerary search: {itins_tried} attempted, {itins_success} successful "
         f"({elapsed_total:.1f}s)"
     )
-    return candidates[0]
+    return candidates
 
 
-def write_tracker(best: Dict, cfg: Dict) -> pathlib.Path:
+def select_tracked_itineraries(
+    candidates: List[Dict], history_path: pathlib.Path, max_daily: int = 5, max_total: int = 10
+) -> List[Dict]:
+    if not candidates:
+        return []
+
+    top_daily = candidates[:max_daily]
+
+    historical_best = None
+    if history_path.exists():
+        hist_df = pd.read_csv(history_path)
+        if not hist_df.empty and "total_price_usd" in hist_df.columns:
+            with pd.option_context("mode.use_inf_as_na", True):
+                prices = pd.to_numeric(hist_df["total_price_usd"], errors="coerce").dropna()
+                if not prices.empty:
+                    historical_best = prices.min()
+
+    record_breakers: List[Dict] = []
+    if historical_best is not None:
+        for itin in candidates[max_daily:]:
+            if itin["total_price"] < historical_best:
+                record_breakers.append(itin)
+
+    tracked: List[Dict] = []
+    seen: set = set()
+    for itin in top_daily + record_breakers:
+        if itin["itinerary_id"] in seen:
+            continue
+        tracked.append(itin)
+        seen.add(itin["itinerary_id"])
+        if len(tracked) >= max_total:
+            break
+
+    return tracked
+
+
+def write_tracker(tracked: List[Dict], cfg: Dict) -> pathlib.Path:
     history_path = REPO_ROOT / cfg.get("history_csv", "data/thailand_tracker.csv")
     history_path.parent.mkdir(parents=True, exist_ok=True)
 
     run_date = dt.date.today().isoformat()
-    seq_str = " > ".join(best["sequence"])
-    outbound = best["legs"][0]
-    inbound = best["legs"][-1]
-    row = {
-        "run_date": run_date,
-        "itinerary_id": best["itinerary_id"],
-        "destinations_sequence": seq_str,
-        "depart_date": best["depart_date"],
-        "return_date": best["return_date"],
-        "total_price_usd": best["total_price"],
-        "price_per_person_usd": round(best["total_price"] / cfg.get("adults", 1), 2),
-        "total_travel_hours": best["total_duration_hours"],
-        "outbound_travel_hours": outbound.duration_hours,
-        "return_travel_hours": inbound.duration_hours,
-        "num_stops_outbound": outbound.stops,
-        "num_stops_return": inbound.stops,
-        "airlines": best["airlines"],
-    }
+    rows = []
+    for idx, itin in enumerate(tracked, start=1):
+        outbound = itin["legs"][0]
+        inbound = itin["legs"][-1]
+        rows.append(
+            {
+                "run_date": run_date,
+                "rank": idx,
+                "itinerary_id": itin["itinerary_id"],
+                "destinations_sequence": " > ".join(itin["sequence"]),
+                "depart_date": itin["depart_date"],
+                "return_date": itin["return_date"],
+                "total_price_usd": itin["total_price"],
+                "price_per_person_usd": round(itin["total_price"] / cfg.get("adults", 1), 2),
+                "total_travel_hours": itin["total_duration_hours"],
+                "outbound_travel_hours": outbound.duration_hours,
+                "return_travel_hours": inbound.duration_hours,
+                "num_stops_outbound": outbound.stops,
+                "num_stops_return": inbound.stops,
+                "airlines": itin["airlines"],
+            }
+        )
 
     if history_path.exists():
         hist = pd.read_csv(history_path, dtype=str)
     else:
         hist = pd.DataFrame()
-    hist = pd.concat([hist, pd.DataFrame([row])], ignore_index=True)
-    hist = hist.drop_duplicates(subset=["run_date"], keep="last")
+
+    hist = pd.concat([hist, pd.DataFrame(rows)], ignore_index=True)
+    hist = hist.drop_duplicates(subset=["run_date", "itinerary_id"], keep="last")
     hist.to_csv(history_path, index=False)
     log(f"Updated tracker: {history_path} ({len(hist)} rows)")
     return history_path
 
 
 def render_markdown_table(best: Dict) -> str:
-    lines = ["| Leg | Flight(s) | Depart → Arrive | Duration | Stops / Layovers |", "| --- | --- | --- | --- | --- |"]
+    lines = [
+        "| Leg | Flight(s) | Depart → Arrive | Duration | Price | Stops / Layovers |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    round_trip_price_shown = False
     for leg in best["legs"]:
         dep = dt.datetime.fromisoformat(leg.departure_iso).strftime("%Y-%m-%d %H:%M")
         arr = dt.datetime.fromisoformat(leg.arrival_iso).strftime("%Y-%m-%d %H:%M")
         layovers = ", ".join(leg.layovers) if leg.layovers else "—"
+        if leg.is_round_trip:
+            if round_trip_price_shown:
+                price_text = ""
+            else:
+                price_text = f"${leg.price:.0f} (round-trip fare)"
+                round_trip_price_shown = True
+        else:
+            price_text = f"${leg.price:.0f}"
         lines.append(
-            f"| {leg.origin} → {leg.dest} | {leg.flight_codes} | {dep} → {arr} | "
-            f"{leg.duration_hours:.1f}h | {leg.stops} stop(s); {layovers} |"
+            f"| {format_location_label(leg.origin)} → {format_location_label(leg.dest)} | {leg.flight_codes} | {dep} → {arr} | "
+            f"{leg.duration_hours:.1f}h | {price_text} | {leg.stops} stop(s); {layovers} |"
         )
     lines.append(
-        f"| **Total** |  |  | **${best['total_price']:.0f} ({best['total_duration_hours']:.1f}h)** |  |"
+        f"| **Total** |  |  | **{best['total_duration_hours']:.1f}h** | **${best['total_price']:.0f}** |  |"
     )
     return "\n".join(lines)
+
+
+def render_html_leg_table(best: Dict) -> str:
+    rows = []
+    round_trip_price_shown = False
+    for leg in best["legs"]:
+        dep = dt.datetime.fromisoformat(leg.departure_iso).strftime("%Y-%m-%d %H:%M")
+        arr = dt.datetime.fromisoformat(leg.arrival_iso).strftime("%Y-%m-%d %H:%M")
+        layovers = ", ".join(leg.layovers) if leg.layovers else "—"
+        if leg.is_round_trip:
+            if round_trip_price_shown:
+                price_text = ""
+            else:
+                price_text = f"${leg.price:.0f} (round-trip fare)"
+                round_trip_price_shown = True
+        else:
+            price_text = f"${leg.price:.0f}"
+        rows.append(
+            """
+            <tr>
+                <td>{origin} → {dest}</td>
+                <td>{codes}</td>
+                <td>{dep} → {arr}</td>
+                <td>{duration:.1f}h</td>
+                <td>{price}</td>
+                <td>{stops} stop(s); {layovers}</td>
+            </tr>
+            """.format(
+                origin=format_location_label(leg.origin),
+                dest=format_location_label(leg.dest),
+                codes=leg.flight_codes,
+                dep=dep,
+                arr=arr,
+                duration=leg.duration_hours,
+                price=price_text,
+                stops=leg.stops,
+                layovers=layovers,
+            )
+        )
+
+    rows.append(
+        f"""
+        <tr>
+            <td><strong>Total</strong></td>
+            <td></td>
+            <td></td>
+            <td><strong>{best['total_duration_hours']:.1f}h</strong></td>
+            <td><strong>${best['total_price']:.0f}</strong></td>
+            <td></td>
+        </tr>
+        """
+    )
+
+    return (
+        "<table border='1' cellpadding='6' cellspacing='0' style='border-collapse: collapse;'>"
+        "<thead><tr><th>Leg</th><th>Flight(s)</th><th>Depart → Arrive</th><th>Duration</th><th>Price</th><th>Stops / Layovers</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody>"
+        "</table>"
+    )
+
+
+def itinerary_summary_plain(itin: Dict) -> str:
+    sequence = " > ".join(format_location_label(c) for c in itin["sequence"])
+    return (
+        f"{sequence} ({itin['depart_date']} → {itin['return_date']}): "
+        f"${itin['total_price']:.0f}, {itin['total_duration_hours']:.1f}h total, "
+        f"airlines {itin['airlines']}"
+    )
+
+
+def itinerary_summary_html(itin: Dict) -> str:
+    sequence = " &gt; ".join(format_location_label(c) for c in itin["sequence"])
+    return (
+        f"<li><strong>{sequence}</strong> ({itin['depart_date']} → {itin['return_date']}): "
+        f"${itin['total_price']:.0f}, {itin['total_duration_hours']:.1f}h total. "
+        f"Airlines: {itin['airlines']}</li>"
+    )
+
+
+def build_email_bodies(best: Dict, tracked: List[Dict], cfg: Dict) -> Tuple[str, str]:
+    best_route = " > ".join(format_location_label(c) for c in best["sequence"])
+    header = "\n".join(
+        [
+            "Thailand 2026 daily fare update",
+            f"Depart {best['depart_date']} → Return {best['return_date']}",
+            f"Route: {best_route}",
+            f"Total price: ${best['total_price']:.2f}",
+            f"Total travel time: {best['total_duration_hours']:.1f}h",
+        ]
+    )
+
+    itinerary_lines = "\n".join(["- " + itinerary_summary_plain(itin) for itin in tracked])
+    plain_body = "\n".join(
+        [
+            header,
+            "",
+            "Top itineraries tracked today:",
+            itinerary_lines,
+        ]
+    )
+
+    html_items = "".join(itinerary_summary_html(itin) for itin in tracked)
+    leg_table = render_html_leg_table(best)
+
+    html_body = f"""
+    <html>
+      <body>
+        <h2>Thailand 2026 daily fare update</h2>
+        <p><strong>Depart:</strong> {best['depart_date']} &nbsp;|&nbsp; <strong>Return:</strong> {best['return_date']}</p>
+        <p><strong>Best route:</strong> {best_route}</p>
+        <p><strong>Total price:</strong> ${best['total_price']:.2f} &nbsp;|&nbsp; <strong>Total travel time:</strong> {best['total_duration_hours']:.1f}h</p>
+        <p><strong>Top itineraries tracked today ({len(tracked)}):</strong></p>
+        <ul>
+          {html_items}
+        </ul>
+        <h3>Best itinerary details</h3>
+        {leg_table}
+      </body>
+    </html>
+    """
+
+    return plain_body, html_body
 
 
 def write_best_markdown(best: Dict, cfg: Dict) -> pathlib.Path:
@@ -514,7 +707,7 @@ def write_best_markdown(best: Dict, cfg: Dict) -> pathlib.Path:
     table = render_markdown_table(best)
     meta = (
         f"## Best Thailand itinerary ({cfg.get('trip_name','')})\n"
-        f"Sequence: {' > '.join(best['sequence'])}\n\n"
+        f"Sequence: {' > '.join(format_location_label(c) for c in best['sequence'])}\n\n"
         f"Depart {best['depart_date']} • Return {best['return_date']}\n\n"
         f"Total price: ${best['total_price']:.2f} • Total travel time: {best['total_duration_hours']:.1f}h\n\n"
     )
@@ -523,14 +716,20 @@ def write_best_markdown(best: Dict, cfg: Dict) -> pathlib.Path:
     return outpath
 
 
-def plot_price_trend(history_csv: pathlib.Path, out_path: pathlib.Path) -> Optional[pathlib.Path]:
+def plot_price_trend(
+    history_csv: pathlib.Path, out_path: pathlib.Path, tracked_ids: Optional[List[str]] = None
+) -> Optional[pathlib.Path]:
     if not history_csv.exists():
         log(f"History CSV missing ({history_csv}); skipping plot.")
         return None
+
     df = pd.read_csv(history_csv)
     if df.empty or "run_date" not in df or "total_price_usd" not in df:
         log("History CSV empty or missing required columns; skipping plot.")
         return None
+
+    if tracked_ids:
+        df = df[df["itinerary_id"].isin(tracked_ids)]
 
     df["run_date"] = pd.to_datetime(df["run_date"], errors="coerce")
     df["total_price_usd"] = pd.to_numeric(df["total_price_usd"], errors="coerce")
@@ -538,14 +737,24 @@ def plot_price_trend(history_csv: pathlib.Path, out_path: pathlib.Path) -> Optio
     if df.empty:
         log("No valid rows to plot; skipping.")
         return None
-    df = df.sort_values("run_date")
 
-    plt.figure(figsize=(7, 3.5))
-    plt.plot(df["run_date"], df["total_price_usd"], marker="o")
-    plt.title("Thailand 2026 total trip price trend")
+    df = df.sort_values(["itinerary_id", "run_date"])
+
+    plt.figure(figsize=(8, 4))
+    for itin_id, group in df.groupby("itinerary_id"):
+        label_seq = group["destinations_sequence"].iloc[-1]
+        plt.plot(
+            group["run_date"],
+            group["total_price_usd"],
+            marker="o",
+            label=f"{label_seq}",
+        )
+
+    plt.title("Thailand 2026 top itinerary price trends")
     plt.xlabel("Run date")
     plt.ylabel("Total price (USD)")
     plt.grid(True, alpha=0.3)
+    plt.legend(fontsize=8)
     plt.tight_layout()
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -557,6 +766,7 @@ def plot_price_trend(history_csv: pathlib.Path, out_path: pathlib.Path) -> Optio
 
 def send_email_notification(
     best: Dict,
+    tracked: List[Dict],
     cfg: Dict,
     history_path: pathlib.Path,
     best_md_path: pathlib.Path,
@@ -591,29 +801,20 @@ def send_email_notification(
         return
 
     sender = email_cfg.get("sender") or username or "thailand-monitor@example.com"
+    best_route = " > ".join(format_location_label(c) for c in best["sequence"])
     subject = (
-        f"[Thailand 2026] ${best['total_price']:.0f} • {' > '.join(best['sequence'])}"
+        f"[Thailand 2026] ${best['total_price']:.0f} • {best_route}"
         f" ({best['depart_date']} → {best['return_date']})"
     )
 
-    body = "\n".join(
-        [
-            "Thailand 2026 daily fare update",
-            f"Depart {best['depart_date']} → Return {best['return_date']}",
-            f"Route: {' > '.join(best['sequence'])}",
-            f"Total price: ${best['total_price']:.2f}",
-            f"Total travel time: {best['total_duration_hours']:.1f}h",
-            "",
-            "Legs (Markdown table):",
-            render_markdown_table(best),
-        ]
-    )
+    plain_body, html_body = build_email_bodies(best, tracked, cfg)
 
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = sender
     msg["To"] = ", ".join(recipients)
-    msg.set_content(body)
+    msg.set_content(plain_body)
+    msg.add_alternative(html_body, subtype="html")
 
     if best_md_path.exists():
         msg.add_attachment(
@@ -678,23 +879,27 @@ def main():
         )
     client = AmadeusClient()
 
-    best = best_itinerary(cfg, client)
-    if not best:
+    candidates = best_itineraries(cfg, client)
+    if not candidates:
         log("No feasible itinerary found for configured windows.")
         sys.exit(3)
 
-    history_path = write_tracker(best, cfg)
+    best = candidates[0]
+    history_path_cfg = REPO_ROOT / cfg.get("history_csv", "data/thailand_tracker.csv")
+    tracked = select_tracked_itineraries(candidates, history_path_cfg)
+
+    history_path = write_tracker(tracked, cfg)
     best_md = write_best_markdown(best, cfg)
 
     plot_path_cfg = cfg.get("plot_path", "plots/thailand_price_trend.png")
-    plot_path = plot_price_trend(history_path, REPO_ROOT / plot_path_cfg)
+    plot_path = plot_price_trend(history_path, REPO_ROOT / plot_path_cfg, [i["itinerary_id"] for i in tracked])
 
-    print(render_markdown_table(best))
+    log(f"Tracked {len(tracked)} itinerary option(s) this run")
     log(f"Best itinerary ID: {best['itinerary_id']}")
     log(f"Markdown summary: {best_md}")
     log(f"Total Amadeus API calls this run: {client.calls}")
 
-    send_email_notification(best, cfg, history_path, best_md, plot_path)
+    send_email_notification(best, tracked, cfg, history_path, best_md, plot_path)
 
 
 if __name__ == "__main__":
