@@ -25,7 +25,7 @@ preferred_departure_hours:
   earliest: 6
   latest: 22
 fast_test:
-  enabled: false
+  enabled: true
   max_departure_dates: 1
   max_return_dates: 1
   max_sequences: 2
