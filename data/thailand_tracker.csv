@@ -1,1 +1,2 @@
 run_date,itinerary_id,destinations_sequence,depart_date,return_date,total_price_usd,price_per_person_usd,total_travel_hours,outbound_travel_hours,return_travel_hours,num_stops_outbound,num_stops_return,airlines
+2025-11-18,2026-05-29_HKT-BKK_2026-06-12,HKT > BKK,2026-05-29,2026-06-12,1522.93,1522.93,51.83,30.17,20.33,1,1,"AI,SL,TG"
