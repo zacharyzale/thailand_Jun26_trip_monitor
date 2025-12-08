@@ -1,11 +1,11 @@
 trip_name: "thailand_2026"
 origin: "ORD"
 departure_window:
-  start: "2026-05-29"
-  end: "2026-06-01"
+  start: "2026-05-19"
+  end: "2026-05-21"
 return_window:
-  start: "2026-06-12"
-  end: "2026-06-14"
+  start: "2026-05-31"
+  end: "2026-06-02"
 cabin: "ECONOMY"
 currency: "USD"
 adults: 1
