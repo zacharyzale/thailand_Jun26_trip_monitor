@@ -3,7 +3,7 @@ Sequence: BKK (Bangkok) > HKT (Phuket)
 
 Depart 2026-05-20 • Return 2026-05-31
 
-Total price: $1304.93 • Total travel time: 49.2h
+Total price: $1305.03 • Total travel time: 49.2h
 
 | Leg | Flight(s) | Depart → Arrive | Duration | Price | Stops / Layovers |
 | --- | --- | --- | --- | --- | --- |
